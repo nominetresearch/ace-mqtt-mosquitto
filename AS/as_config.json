@@ -1,0 +1,13 @@
+{
+  "host": "127.0.0.1",
+  "port": 3001,
+  "port_https": 8001,
+  "security": {
+    "tokenLife": 36000000,
+    "clientSecretLife": 6,
+    "sessionSecret":"Replace me!"
+  },
+  "mongoose":{
+    "uri": "mongodb://localhost:27017/mqtt-as"
+  }
+}
