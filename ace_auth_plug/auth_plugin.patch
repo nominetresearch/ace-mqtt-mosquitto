@@ -1,0 +1,1460 @@
+diff --git a/Makefile b/Makefile
+index 252d570..108c23c 100644
+--- a/Makefile
++++ b/Makefile
+@@ -6,7 +6,7 @@ BE_CFLAGS =
+ BE_LDFLAGS =
+ BE_LDADD =
+ BE_DEPS =
+-OBJS = auth-plug.o base64.o pbkdf2-check.o log.o envs.o hash.o be-psk.o backends.o cache.o
++OBJS = auth-plug.o base64.o pbkdf2-check.o log.o envs.o hash.o be-psk.o backends.o cache.o token-cache.o
+ 
+ BACKENDS =
+ BACKENDSTR =
+@@ -108,6 +108,15 @@ ifneq ($(BACKEND_MONGO), no)
+ 	OBJS += be-mongo.o
+ endif
+ 
++#Cigdem: Added for ACE
++ifneq ($(BACKEND_ACE), no)
++	BACKENDS += -DBE_ACE
++	BACKENDSTR += ACE
++	
++	BE_LDADD += -lcurl
++	OBJS += be-ace.o nxjson.o
++endif
++ 
+ ifneq ($(BACKEND_FILES), no)
+ 	BACKENDS+= -DBE_FILES
+ 	BACKENDSTR += Files
+@@ -124,7 +133,7 @@ ifneq ($(SUPPORT_DJANGO_HASHERS), no)
+ endif
+ 
+ OSSLINC = -I$(OPENSSLDIR)/include
+-OSSLIBS = -L$(OPENSSLDIR)/lib -lcrypto
++OSSLIBS = -L$(OPENSSLDIR)/lib -lssl -lcrypto
+ 
+ CFLAGS := $(CFG_CFLAGS)
+ CFLAGS += -I$(MOSQUITTO_SRC)/src/
+@@ -157,7 +166,7 @@ printconfig:
+ 
+ 
+ auth-plug.so : $(OBJS) $(BE_DEPS)
+-	$(CC) $(CFLAGS) $(LDFLAGS) -fPIC -shared -o $@ $(OBJS) $(BE_DEPS) $(LDADD)
++	$(CC) $(CFLAGS) $(LDFLAGS) -fPIC -shared -undefined dynamic_lookup -o $@ $(OBJS) $(BE_DEPS) $(LDADD)
+ 
+ be-redis.o: be-redis.c be-redis.h log.h hash.h envs.h Makefile
+ be-memcached.o: be-memcached.c be-memcached.h log.h hash.h envs.h Makefile
+@@ -178,8 +187,10 @@ cache.o: cache.c cache.h uthash.h Makefile
+ be-http.o: be-http.c be-http.h Makefile backends.h
+ be-jwt.o: be-jwt.c be-jwt.h Makefile backends.h
+ be-mongo.o: be-mongo.c be-mongo.h Makefile
++#cigdem
++token-cache.o: token-cache.h token-cache.c uthash.h Makefile
++be-ace.o: be-ace.c be-ace.h Makefile backends.h nxjson.h nxjson.c token-cache.h token-cache.c
+ be-files.o: be-files.c be-files.h Makefile
+-
+ np: np.c base64.o
+ 	$(CC) $(CFLAGS) $(LDFLAGS) $^ -o $@ $(OSSLIBS)
+ 
+diff --git a/auth-plug.c b/auth-plug.c
+index 744f115..c492c5a 100644
+--- a/auth-plug.c
++++ b/auth-plug.c
+@@ -44,6 +44,7 @@
+ # define MOSQ_DENY_ACL	MOSQ_ERR_ACL_DENIED
+ #endif
+ 
++
+ #include "log.h"
+ #include "hash.h"
+ #include "backends.h"
+@@ -62,9 +63,14 @@
+ #include "be-mongo.h"
+ #include "be-files.h"
+ 
++//Cigdem: ACE
++#include "be-ace.h"
++
++
+ #include "userdata.h"
+ #include "cache.h"
+ 
++
+ #define STRINGIFY(x) #x
+ #define TOSTRING(x) STRINGIFY(x)
+ 
+@@ -409,6 +415,25 @@ int mosquitto_auth_plugin_init(void **userdata, struct mosquitto_auth_opt *auth_
+ 		}
+ #endif
+ 
++#if BE_ACE
++		if(!strcmp(q, "ace")){
++			*bep = (struct backend_p *)malloc(sizeof(struct backend_p));
++			memset(*bep, 0, sizeof(struct backend_p));
++			(*bep)->name = strdup("ace");
++			(*bep)->conf = be_ace_init(); 
++		        if ((*bep)->conf == NULL){
++				_fatal("%s init returns NULL", q); 
++			}
++			(*bep)->kill = be_ace_destroy;
++			(*bep)->getuser = be_ace_getuser;
++			(*bep)->superuser = be_ace_superuser;
++			(*bep)->aclcheck = be_ace_aclcheck;
++			found = 1; 
++			PSKSETUP;		
++		} 
++#endif
++
++	
+ #if BE_FILES
+ 		if (!strcmp(q, "files")) {
+ 			*bep = (struct backend_p *)malloc(sizeof(struct backend_p));
+@@ -602,17 +627,21 @@ int mosquitto_auth_acl_check(void *userdata, const char *clientid, const char *u
+ 		access == MOSQ_ACL_READ ? "MOSQ_ACL_READ" : "MOSQ_ACL_WRITE" );
+ 
+ 
+-	granted = acl_cache_q(clientid, username, topic, access, userdata);
++	//Bypass ACL check if ACE - change to if b->name == ace
++	#ifndef BE_ACE
++	granted = cache_q(clientid, username, topic, access, userdata);
+ 	if (granted != MOSQ_ERR_UNKNOWN) {
+ 		_log(LOG_DEBUG, "aclcheck(%s, %s, %d) CACHEDAUTH: %d",
+ 			username, topic, access, granted);
+ 		return (granted);
+ 	}
++	#endif
+ 
+ 	if (!username || !*username || !topic || !*topic) {
+ 		granted =  MOSQ_DENY_ACL;
+ 		goto outout;
+ 	}
++	
+ 
+ 
+ 	/* Check for usernames exempt from ACL checking, first */
+@@ -669,6 +698,11 @@ int mosquitto_auth_acl_check(void *userdata, const char *clientid, const char *u
+ 			_log(LOG_DEBUG, "aclcheck(%s, %s, %d) HAS_ERROR=Y by %s",
+ 				username, topic, access, b->name);
+ 			has_error = TRUE;
++		} else if (match == 0){ //Cigdem: Adding the option of no backend error, but aclcheck fails
++			backend_name = b->name;
++			authorized = FALSE; 
++			_log(LOG_DEBUG, "aclcheck(%s, %s, %d) acl fail with %s",
++                                username, topic, access, b->name);
+ 		}
+ 	}
+ 
+@@ -676,16 +710,20 @@ int mosquitto_auth_acl_check(void *userdata, const char *clientid, const char *u
+ 		username, topic, access, authorized, (backend_name) ? backend_name : "none");
+ 
+ 	granted = (authorized) ?  MOSQ_ERR_SUCCESS : MOSQ_DENY_ACL;
+-
+-   outout:	/* goto fail goto fail */
+-
+-	if (granted == MOSQ_DENY_ACL && has_error) {
++	if (granted == MOSQ_DENY_ACL){ //Cigdem: Adding the option of returning MOSQ_ERR_ACL_DENIED
++	   if(has_error) {
+ 		_log(LOG_DEBUG, "aclcheck(%s, %s, %d) AUTHORIZED=N HAS_ERROR=Y => ERR_UNKNOWN",
+ 			username, topic, access);
+ 		granted = MOSQ_ERR_UNKNOWN;
++	   } else {
++		granted = MOSQ_ERR_ACL_DENIED;
++	   }
+ 	}
+ 
+-	acl_cache(clientid, username, topic, access, granted, userdata);
++   outout:	/* goto fail goto fail */
++	#ifndef BE_ACE
++		acl_cache(clientid, username, topic, access, granted, userdata);
++	#endif
+ 	return (granted);
+ 
+ }
+diff --git a/be-ace.c b/be-ace.c
+new file mode 100644
+index 0000000..45b5082
+--- /dev/null
++++ b/be-ace.c
+@@ -0,0 +1,560 @@
++/*
++*
++*/
++
++#ifdef BE_ACE
++
++#include "backends.h"
++#include "be-ace.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include "hash.h"
++#include "log.h"
++#include "envs.h"
++#include <curl/curl.h>
++
++
++struct recvData{
++	char *data; 
++	size_t size;
++};
++
++static struct recvData token_introspection_result;
++
++size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdata){
++	size_t real_size = size * nmemb;
++	struct recvData *recv_data = (struct recvData *)userdata;
++
++	recv_data->data = realloc(recv_data->data, recv_data->size + real_size + 1); 
++	if(recv_data->data == NULL){
++		_log(LOG_DEBUG, "Not enough memory\n");
++		return 0;  
++	} 
++
++	memcpy(&(recv_data->data[recv_data->size]), ptr, real_size); 
++	recv_data->size += real_size;
++	recv_data->data[recv_data->size]=0;
++	return real_size;
++}
++
++static int get_string_envs(CURL *curl, const char *required_env, char *querystring){
++	
++	char *data = NULL;
++	char *escaped_key = NULL;
++	char *escaped_val = NULL;
++	char *env_string = NULL;
++
++	char *params_key[MAXPARAMSNUM];
++	char *env_names[MAXPARAMSNUM];
++	char *env_value[MAXPARAMSNUM];
++
++	int i, num = 0; 
++
++	env_string =  (char *)malloc(strlen(required_env)+20); 
++	if (env_string == NULL){
++		_fatal("ENOMEM");
++		return(-1);
++	}
++	sprintf(env_string, "%s", required_env); 
++	
++	num = get_sys_envs(env_string, ",", "=", params_key, env_names, env_value); 
++	
++	for(i=0; i < num; i++){
++		escaped_key = curl_easy_escape(curl, params_key[i],0); 
++		escaped_val = curl_easy_escape(curl, env_value[i], 0); 
++		
++		_log(LOG_DEBUG, "key=%s", params_key[i]); 
++		_log(LOG_DEBUG, "escaped_key=%s", escaped_key); 
++		_log(LOG_DEBUG, "escaped_val=%s", escaped_val); 
++		
++		data = (char *)malloc(strlen(escaped_key) + strlen(escaped_val) + 1); 
++		
++		if (data == NULL){
++			_fatal("ENOMEM"); 
++			return(-1); 
++		}
++		sprintf(data,"%s=%s&",escaped_key, escaped_val); 
++		if (i==0) {
++			sprintf(querystring, "%s", data); 
++		} else {
++			strcat(querystring, data); 
++		}
++	}
++	
++	if(data) free(data); 
++	if(escaped_key) free(escaped_key); 
++	if(escaped_val) free(escaped_val); 
++	free(env_string); 
++	return(num); 	
++}
++
++
++static int http_post(void *handle, char *uri, const char *clientid, const char *username, const char *token,  const char *topic, int acc, int method)
++{	
++	
++	struct ace_backend *conf = (struct ace_backend *)handle; 
++	CURL *curl; 
++	struct curl_slist *headerlist=NULL;
++	
++	int re;
++	int respCode = 0; 
++	int ok = FALSE; 
++	char *url;
++	char *data; 
++
++	token_introspection_result.data = malloc(1); 
++	token_introspection_result.size = 0;
++
++	if (token == NULL){
++		return (FALSE); 
++	} 
++	
++	if ((curl = curl_easy_init()) == NULL) {
++		_fatal("create curl_easy_handle fails"); 
++		return (FALSE); 
++	} 
++
++	if (conf->hostheader != NULL)
++		headerlist = curl_slist_append(headerlist, conf->hostheader); 
++	headerlist = curl_slist_append(headerlist, "Expect:"); 
++	
++
++	if (conf->basic_auth != NULL) 
++		headerlist = curl_slist_append(headerlist, conf->basic_auth); 
++
++	url = (char *)malloc(strlen(conf->ip) + strlen(uri) + 20); 
++	if (url == NULL){
++		_fatal("ENOMEM"); 
++		return (FALSE); 
++	}
++
++	//enable https if with_tls is true
++	if (strcmp(conf->with_tls, "true") == 0){
++		sprintf(url, "https://%s:%d%s", conf->ip, conf->port, uri);
++	} else {
++		sprintf(url, "http://%s:%d%s", conf->ip, conf->port, uri); 
++	
++	}
++
++	char *escaped_token = curl_easy_escape(curl, token, 0);   
++
++	char *string_envs = (char *)malloc(MAXPARAMSLEN); 
++	if (string_envs == NULL){
++		_fatal("ENOMEM"); 
++		return (FALSE); 
++	}
++	
++	memset(string_envs, 0, MAXPARAMSLEN); 
++	
++	//get the sys envs
++	int env_num = 0; 
++	if (method == METHOD_GETUSER && conf->getuser_envs != NULL){
++		env_num = get_string_envs(curl, conf->getuser_envs, string_envs); 
++	} else if (method == METHOD_SUPERUSER && conf->superuser_envs != NULL) {
++		env_num = get_string_envs(curl, conf->superuser_envs, string_envs); 
++	} else if (method == METHOD_ACLCHECK && conf->aclcheck_envs != NULL) {
++		env_num = get_string_envs(curl, conf->aclcheck_envs, string_envs); 
++	}
++	if(env_num == -1){
++		return (FALSE); 
++	}
++	
++	data = (char *)malloc(strlen(string_envs) + strlen(escaped_token) + 10); 
++
++	if (data == NULL){
++		_fatal("ENOMEM"); 
++		return (FALSE);
++	}
++
++	sprintf(data, "%stoken=%s", 
++		string_envs, 
++		escaped_token); 
++
++	_log(LOG_DEBUG, "url=%s", url); 
++	_log(LOG_DEBUG, "data=%s", data); 
++	
++	curl_easy_setopt(curl, CURLOPT_URL, url); 
++	curl_easy_setopt(curl, CURLOPT_POST, 1L); 
++	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data); 
++	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headerlist); 
++	curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);   
++	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10); 
++	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback); 	
++	curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&token_introspection_result); 
++
++	re = curl_easy_perform(curl); 
++	if (re == CURLE_OK){
++
++		re = curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &respCode); 
++		if (re == CURLE_OK & respCode >= 200 && respCode < 300){
++			ok=TRUE;
++		} else if (re == CURLE_OK && respCode >= 500){
++			ok = BACKEND_ERROR; 
++		} //else returns ok = FALSE and captures other error codes
++	} else {
++		_log(LOG_DEBUG, "http req fail url=%s re=%s", url, curl_easy_strerror(re)); 
++		ok = BACKEND_ERROR; 
++	}
++
++	curl_easy_cleanup(curl); 
++	curl_slist_free_all(headerlist); 
++	free(url); 
++	free(data);
++	free(string_envs); 
++	free(escaped_token);  
++	return (ok); 
++}
++
++void *be_ace_init(){
++	struct ace_backend *conf; 
++	char *ip; 
++	char *getuser_uri;
++	char *superuser_uri;
++	char *aclcheck_uri;
++
++	if (curl_global_init(CURL_GLOBAL_ALL) != CURLE_OK) {
++		_fatal("init curl fail"); 
++		return (NULL); 
++	}
++
++	if ((ip = p_stab("http_ip")) == NULL) {
++		_fatal("Mandatory parameter `http_ip' missing"); 
++		return (NULL); 
++	}
++
++	if ((getuser_uri = p_stab("http_getuser_uri")) == NULL) {
++		_fatal("Mandatory parameter `http_getuser_uri' missing"); 
++		return (NULL); 
++	}
++
++	if ((superuser_uri =p_stab("http_superuser_uri")) == NULL) {
++		_fatal("Mandatory parameter `http_superuser_uri' missing"); 
++		return (NULL); 
++	}
++
++	if ((aclcheck_uri = p_stab("http_aclcheck_uri")) == NULL) {
++		_fatal("Mandatory parameter `http_aclcheck_uri' missing");
++		return (NULL); 
++	}
++
++	conf = (struct ace_backend *)malloc(sizeof(struct ace_backend)); 
++
++	conf->ip = ip; 
++	conf->port = p_stab("http_port") == NULL ? 80 : atoi(p_stab("http_port")); 
++	if (p_stab("http_hostname") != NULL) {
++		conf->hostheader = (char *)malloc(128); 
++		sprintf(conf->hostheader, "Host: %s", p_stab("http_hostname")); 
++	} else {
++		conf->hostheader = NULL; 
++	}
++
++
++	conf->getuser_uri = getuser_uri;
++	conf->superuser_uri = superuser_uri;
++	conf->aclcheck_uri = aclcheck_uri;
++
++	conf->getuser_envs = p_stab("http_getuser_params"); 
++	conf->superuser_envs = p_stab("http_superuser_params"); 
++	conf->aclcheck_envs = p_stab("http_aclcheck_params"); 
++	if(p_stab("http_basic_auth_key") != NULL){
++		conf->basic_auth = (char *)malloc(strlen("Authorization: Basic %s") + strlen(p_stab("http_basic_auth_key"))); 
++		sprintf(conf->basic_auth, "Authorization: Basic %s", p_stab("http_basic_auth_key")); 
++	}	
++
++	if(p_stab("http_wit_tls") != NULL){
++		conf->with_tls = p_stab("http_with_tls"); 
++	} else {
++		conf->with_tls = "false";
++	}
++
++	 conf->retry_count = p_stab("http_retry_count") == NULL ? 3 : atoi(p_stab("http_retry_count")); 
++
++	_log(LOG_DEBUG, "with_tls=%s", conf->with_tls);
++	_log(LOG_DEBUG, "getuser_uri=%s", getuser_uri); 
++	_log(LOG_DEBUG, "superuser_uri=%s", superuser_uri); 
++	_log(LOG_DEBUG, "aclcheck_uri=%s", aclcheck_uri); 
++	_log(LOG_DEBUG, "getuser_params=%s", conf->getuser_envs); 
++	_log(LOG_DEBUG, "superuser_params=%s", conf->superuser_envs); 
++	_log(LOG_DEBUG, "aclcheck_params=%s", conf->aclcheck_envs); 
++	_log(LOG_DEBUG, "retry_count=%d", conf->retry_count); 
++
++	return (conf); 
++};
++
++void be_ace_destroy(void *handle){
++	struct ace_backend *conf = (struct ace_backend *)handle;
++	
++	if (conf){
++		curl_global_cleanup();
++
++		free(conf); 
++	}
++
++	free(token_introspection_result.data);
++};
++
++
++//decide how you want to implement username, and password
++//shall we implement retries or not?
++char *be_ace_getuser(void *handle, const char *token_mac, const char *username, int *authenticated) 
++{
++	struct ace_backend *conf = (struct ace_backend *)handle;
++	int re, try; 
++
++	char *mac, *token, *token_to_introspect;
++
++	char *as_result = NULL;
++	const nx_json *json = NULL;
++	int active = 0;
++	const nx_json *jwk_obj;
++	//const nx_json *k; 
++
++	char *secret_key=NULL;
++	//char  *secret_key_beg, *secret_key_end;
++
++	unsigned char hash[EVP_MAX_MD_SIZE];
++        unsigned int hash_len;
++	char *encoded_hash = NULL;
++	int hash_result;
++
++        const EVP_MD *digest;
++#if OPENSSL_VERSION_NUMBER < 0x10100000L
++        EVP_MD_CTX context;
++#else
++        EVP_MD_CTX *context;
++#endif
++
++	//initially not authenticated
++	*authenticated = 0;
++
++	if (token_mac  == NULL){
++		return NULL;
++	}
++
++	_log(LOG_DEBUG,"username=%s",username);
++	_log(LOG_DEBUG,"token=%s", token_mac);
++
++
++	if(strcmp(username,"ace")==0){
++		token=strstr(token_mac, "token:"); 
++		mac = strstr(token_mac, "mac:"); 
++
++		if(!token || !mac){
++			_log(LOG_DEBUG, "Error: No token or mac"); 
++			return NULL;
++		} else {
++			token+=strlen("token:");
++			token_to_introspect = (char *) malloc(mac-token+1); 
++			memcpy(token_to_introspect, token, mac-token); 
++			token_to_introspect[mac-token]='\0';
++
++			mac += strlen("mac:");
++			//_log(LOG_DEBUG, "Token to introspect=%s", token_to_introspect); 
++			//_log(LOG_DEBUG, "MAC=%s", mac); 
++		}
++		
++	} else {
++		_log(LOG_DEBUG, "Error: user not ace");
++		return NULL;
++	}
++
++
++	re = BACKEND_ERROR; 
++	try = 0; 
++
++	while (re == BACKEND_ERROR && try <= conf->retry_count){
++		try++;
++		re = http_post(handle, conf->getuser_uri, NULL, NULL, token_to_introspect, NULL, -1, METHOD_GETUSER); 
++	}
++
++	
++	if (re == 1){
++		//checking the response
++		 _log(LOG_DEBUG, "ACE Result: %s", token_introspection_result.data);
++                 //as_result = strstr(token_introspection_result.data,"\"active\":true");
++		
++		as_result = (char *) malloc(strlen(token_introspection_result.data)); 
++		memcpy(as_result, token_introspection_result.data, strlen(token_introspection_result.data)); 
++		json = nx_json_parse(as_result,0); 
++		if(json){
++			active = nx_json_get(json, "active")->int_value;
++			//_log(LOG_DEBUG, "ACE result active: %s", active? "true":"false");
++			
++		}	
++		//get the key
++		if(active){
++			
++			jwk_obj = nx_json_get(nx_json_get(json, "cnf"),"jwk");
++			secret_key = (char *)nx_json_get(jwk_obj, "k")->text_value;	
++			
++	
++			if(secret_key){
++				//_log(LOG_DEBUG, "Secret key: %s", secret_key); 
++				
++			//Digest of the token with key - assumes sha512! 
++				digest = EVP_get_digestbyname("sha512");
++				if(!digest){
++				  fprintf(stderr, "Error: Unable to create openssl digest.\n");
++				}
++#if OPENSSL_VERSION_NUMBER < 0x10100000L
++				EVP_MD_CTX_init(&context);
++				EVP_DigestInit_ex(&context, digest, NULL);
++				EVP_DigestUpdate(&context, token_to_introspect, strlen(token_to_introspect));
++				EVP_DigestUpdate(&context, secret_key, strlen(secret_key));
++				EVP_DigestFinal_ex(&context, hash, &hash_len);
++				EVP_MD_CTX_cleanup(&context);
++#else
++				context = EVP_MD_CTX_new();
++				EVP_DigestInit_ex(context, digest, NULL);
++				EVP_DigestUpdate(context, final_password, strlen(final_password));
++				EVP_DigestUpdate(context, secret_key, strlen(secret_key));
++				EVP_DigestFinal_ex(context, hash, &hash_len);
++				EVP_MD_CTX_free(context);
++#endif
++				hash_result = base64_encode(hash, hash_len, &encoded_hash);
++				if(!hash_result){
++				  if(encoded_hash) free(encoded_hash);
++				  _log(LOG_DEBUG, "Error: Unable to encode.\n");
++				} else {
++				  _log(LOG_DEBUG, "Success: encoded digested test: %s\n",encoded_hash );
++
++				  if(strcmp(mac,(const char*)hash)){
++				       *authenticated = 1;
++					//parse and cache the token for aclcheck
++					//client_id: token: sub
++					//username: ace
++					//topic: token->aud
++					//access: token->scope
++					char *sub, *audience;
++					const nx_json *scope_array;
++					int it;
++					const nx_json *scope; 
++					int access[2];
++					time_t exp;
++					struct tm *tstruct = malloc(sizeof(tstruct));  
++
++					sub = (char *)nx_json_get(json, "sub")->text_value;
++					audience = (char *)nx_json_get(json, "aud")->text_value;	
++					scope_array = nx_json_get(json, "scope");
++					if(scope_array->length != 2){
++						_log(LOG_DEBUG, "Scope array length different than expected, will copy at most two scopes");
++					} 
++					
++					int length = scope_array->length < 2 ? scope_array->length:2;
++
++					for(it=0; it<length; it++){
++						scope= nx_json_item(scope_array, it); 
++						if(strcmp(scope->text_value, "sub") == 0){
++							access[it] = 1; 
++						} else if(strcmp(scope->text_value, "pub") == 0){
++							access[it] = 2; 
++						} else {
++							access[it] = 0; //unknown scope
++						}
++					}				
++
++					 exp = nx_json_get(json, "exp")->int_value;
++					
++					_log(LOG_DEBUG, "Caching: token %s, audience %s, access %d, exp %s", token_to_introspect, audience, access[0], ctime(&exp)); 
++					token_cache(token_to_introspect, audience, access,exp);
++				  }
++				}
++			 } 
++		} 
++	} 
++
++	if(as_result) free(as_result);
++ 	if(token_to_introspect)	free(token_to_introspect);		
++	if(json) nx_json_free(json); 
++	
++	return NULL;
++	
++}
++
++int be_ace_superuser(void *handle, const char *token)
++{
++	//struct ace_backend *conf = (struct ace_backend *)handle;
++	int re; 
++	//int try;
++
++	re = 0;
++	//try = 0; 
++
++	//Do not support superuser for now
++	/* 
++	  while (re == BACKEND_ERROR && try <= conf->retry_count) {
++		try++;
++		re = http_post(handle, conf->superuser_uri, NULL, token, NULL,NULL, -1, METHOD_SUPERUSER);
++	 }
++	*/
++	return re;
++};
++
++int be_ace_aclcheck(void *handle, const char *clientid, const char *username, const char *topic, int acc)
++{
++	
++	//struct ace_backend *conf = (struct ace_backend *)handle;
++	int re;
++	
++	char *token, *token_to_introspect, *mac;  
++
++	//read the cache to find an active token with the hash of clientid, username, and 	 //topic
++	//int action = 0; //scope at the beginning, requested action not defined; 
++	struct tokenParams cachedToken; 	
++
++	
++
++	re = BACKEND_ERROR;
++
++	//The authorization for topics in token
++	//acc 1 == SUB, 2 == PUB
++
++	//parse the username to get out the token 
++	token=strstr(username, "token:");
++        mac = strstr(username, "mac:");
++
++        if(!token || !mac){
++               _log(LOG_DEBUG, "Error: No token or mac in username");
++               return re;
++        } else {
++               token+=strlen("token:");
++               token_to_introspect = (char *) malloc(mac-token+1);
++               memcpy(token_to_introspect, token, mac-token);
++               token_to_introspect[mac-token]='\0';
++
++               mac += strlen("mac:");
++        }
++
++
++	//read the cache
++	cachedToken = token_cache_q(token_to_introspect); 
++	_log(LOG_DEBUG, "Token returned: topic %s acc: %d",cachedToken.topic,cachedToken.access[0]); 
++
++
++	if(cachedToken.active == 0){
++		_log(LOG_DEBUG, "No active token");
++		re = 0;  
++	} else {
++		if(strcmp(cachedToken.topic, topic)){
++			_log(LOG_DEBUG, "Topic does not match cached %s request %s",cachedToken.topic,topic); 
++			re = 0;
++		}else {
++			//We have two scopes - pub or sub
++			for(int it=0; it<2;it++){
++				if(cachedToken.access[it] == acc){
++					re = 1;
++					break; 
++				}	
++			}
++
++			if(re!=1) re=0; //This is not a BACKEND_ERR anymore;	
++
++		}		
++
++	} 
++
++	return re;
++}	
++
++#endif //BE_ACE
+diff --git a/be-ace.h b/be-ace.h
+new file mode 100644
+index 0000000..9884176
+--- /dev/null
++++ b/be-ace.h
+@@ -0,0 +1,51 @@
++/* 
++*
++*
++*/
++
++#include <stddef.h>
++
++#ifdef BE_ACE
++
++#include <openssl/evp.h>
++#include <openssl/rand.h>
++#include <openssl/buffer.h>
++#include "base64.h"
++#include "nxjson.h"
++#include "token-cache.h"
++
++#define MAXPARAMSLEN    1024
++#define METHOD_GETUSER     1
++#define METHOD_SUPERUSER   2
++#define METHOD_ACLCHECK    3
++
++struct ace_backend{
++	char *ip; 
++	int port; 
++	char *hostheader; 
++	char *getuser_uri;
++	char *superuser_uri;
++	char *aclcheck_uri;
++
++
++	//Do we need these three?
++	char *getuser_envs;
++	char *superuser_envs;
++	char *aclcheck_envs;
++
++	char *with_tls;
++	char *basic_auth;
++	int retry_count;
++};
++
++
++//Think about renaming the parameters
++void *be_ace_init();
++void be_ace_destroy(void *conf); 
++char *be_ace_getuser(void *conf, const char *username, const char *password, int *authenticated); 
++int be_ace_superuser(void *conf, const char *username); 
++int be_ace_aclcheck(void *conf, const char *clientid, const char *username, const char *topic, int acc); 
++
++size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdata); 
++
++#endif
+diff --git a/nxjson.c b/nxjson.c
+new file mode 100644
+index 0000000..71db528
+--- /dev/null
++++ b/nxjson.c
+@@ -0,0 +1,387 @@
++/*
++ * Copyright (c) 2013 Yaroslav Stavnichiy <yarosla@gmail.com>
++ *
++ * This file is part of NXJSON.
++ *
++ * NXJSON is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU Lesser General Public License
++ * as published by the Free Software Foundation, either version 3
++ * of the License, or (at your option) any later version.
++ *
++ * NXJSON is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with NXJSON. If not, see <http://www.gnu.org/licenses/>.
++ */
++
++// this file can be #included in your code
++#ifndef NXJSON_C
++#define NXJSON_C
++
++#ifdef  __cplusplus
++extern "C" {
++#endif
++
++
++#include <stdlib.h>
++#include <stdio.h>
++#include <string.h>
++#include <assert.h>
++#include <errno.h>
++
++#include "nxjson.h"
++
++// redefine NX_JSON_CALLOC & NX_JSON_FREE to use custom allocator
++#ifndef NX_JSON_CALLOC
++#define NX_JSON_CALLOC() calloc(1, sizeof(nx_json))
++#define NX_JSON_FREE(json) free((void*)(json))
++#endif
++
++// redefine NX_JSON_REPORT_ERROR to use custom error reporting
++#ifndef NX_JSON_REPORT_ERROR
++#define NX_JSON_REPORT_ERROR(msg, p) fprintf(stderr, "NXJSON PARSE ERROR (%d): " msg " at %s\n", __LINE__, p)
++#endif
++
++#define IS_WHITESPACE(c) ((unsigned char)(c)<=(unsigned char)' ')
++
++static const nx_json dummy={ NX_JSON_NULL };
++
++static nx_json* create_json(nx_json_type type, const char* key, nx_json* parent) {
++  nx_json* js=NX_JSON_CALLOC();
++  assert(js);
++  js->type=type;
++  js->key=key;
++  if (!parent->last_child) {
++    parent->child=parent->last_child=js;
++  }
++  else {
++    parent->last_child->next=js;
++    parent->last_child=js;
++  }
++  parent->length++;
++  return js;
++}
++
++void nx_json_free(const nx_json* js) {
++  nx_json* p=js->child;
++  nx_json* p1;
++  while (p) {
++    p1=p->next;
++    nx_json_free(p);
++    p=p1;
++  }
++  NX_JSON_FREE(js);
++}
++
++static int unicode_to_utf8(unsigned int codepoint, char* p, char** endp) {
++  // code from http://stackoverflow.com/a/4609989/697313
++  if (codepoint<0x80) *p++=codepoint;
++  else if (codepoint<0x800) *p++=192+codepoint/64, *p++=128+codepoint%64;
++  else if (codepoint-0xd800u<0x800) return 0; // surrogate must have been treated earlier
++  else if (codepoint<0x10000) *p++=224+codepoint/4096, *p++=128+codepoint/64%64, *p++=128+codepoint%64;
++  else if (codepoint<0x110000) *p++=240+codepoint/262144, *p++=128+codepoint/4096%64, *p++=128+codepoint/64%64, *p++=128+codepoint%64;
++  else return 0; // error
++  *endp=p;
++  return 1;
++}
++
++nx_json_unicode_encoder nx_json_unicode_to_utf8=unicode_to_utf8;
++
++static inline int hex_val(char c) {
++  if (c>='0' && c<='9') return c-'0';
++  if (c>='a' && c<='f') return c-'a'+10;
++  if (c>='A' && c<='F') return c-'A'+10;
++  return -1;
++}
++
++static char* unescape_string(char* s, char** end, nx_json_unicode_encoder encoder) {
++  char* p=s;
++  char* d=s;
++  char c;
++  while ((c=*p++)) {
++    if (c=='"') {
++      *d='\0';
++      *end=p;
++      return s;
++    }
++    else if (c=='\\') {
++      switch (*p) {
++        case '\\':
++        case '/':
++        case '"':
++          *d++=*p++;
++          break;
++        case 'b':
++          *d++='\b'; p++;
++          break;
++        case 'f':
++          *d++='\f'; p++;
++          break;
++        case 'n':
++          *d++='\n'; p++;
++          break;
++        case 'r':
++          *d++='\r'; p++;
++          break;
++        case 't':
++          *d++='\t'; p++;
++          break;
++        case 'u': // unicode
++          if (!encoder) {
++            // leave untouched
++            *d++=c;
++            break;
++          }
++          char* ps=p-1;
++          int h1, h2, h3, h4;
++          if ((h1=hex_val(p[1]))<0 || (h2=hex_val(p[2]))<0 || (h3=hex_val(p[3]))<0 || (h4=hex_val(p[4]))<0) {
++            NX_JSON_REPORT_ERROR("invalid unicode escape", p-1);
++            return 0;
++          }
++          unsigned int codepoint=h1<<12|h2<<8|h3<<4|h4;
++          if ((codepoint & 0xfc00)==0xd800) { // high surrogate; need one more unicode to succeed
++            p+=6;
++            if (p[-1]!='\\' || *p!='u' || (h1=hex_val(p[1]))<0 || (h2=hex_val(p[2]))<0 || (h3=hex_val(p[3]))<0 || (h4=hex_val(p[4]))<0) {
++              NX_JSON_REPORT_ERROR("invalid unicode surrogate", ps);
++              return 0;
++            }
++            unsigned int codepoint2=h1<<12|h2<<8|h3<<4|h4;
++            if ((codepoint2 & 0xfc00)!=0xdc00) {
++              NX_JSON_REPORT_ERROR("invalid unicode surrogate", ps);
++              return 0;
++            }
++            codepoint=0x10000+((codepoint-0xd800)<<10)+(codepoint2-0xdc00);
++          }
++          if (!encoder(codepoint, d, &d)) {
++            NX_JSON_REPORT_ERROR("invalid codepoint", ps);
++            return 0;
++          }
++          p+=5;
++          break;
++        default:
++          // leave untouched
++          *d++=c;
++          break;
++      }
++    }
++    else {
++      *d++=c;
++    }
++  }
++  NX_JSON_REPORT_ERROR("no closing quote for string", s);
++  return 0;
++}
++
++static char* skip_block_comment(char* p) {
++  // assume p[-2]=='/' && p[-1]=='*'
++  char* ps=p-2;
++  if (!*p) {
++    NX_JSON_REPORT_ERROR("endless comment", ps);
++    return 0;
++  }
++  REPEAT:
++  p=strchr(p+1, '/');
++  if (!p) {
++    NX_JSON_REPORT_ERROR("endless comment", ps);
++    return 0;
++  }
++  if (p[-1]!='*') goto REPEAT;
++  return p+1;
++}
++
++static char* parse_key(const char** key, char* p, nx_json_unicode_encoder encoder) {
++  // on '}' return with *p=='}'
++  char c;
++  while ((c=*p++)) {
++    if (c=='"') {
++      *key=unescape_string(p, &p, encoder);
++      if (!*key) return 0; // propagate error
++      while (*p && IS_WHITESPACE(*p)) p++;
++      if (*p==':') return p+1;
++      NX_JSON_REPORT_ERROR("unexpected chars", p);
++      return 0;
++    }
++    else if (IS_WHITESPACE(c) || c==',') {
++      // continue
++    }
++    else if (c=='}') {
++      return p-1;
++    }
++    else if (c=='/') {
++      if (*p=='/') { // line comment
++        char* ps=p-1;
++        p=strchr(p+1, '\n');
++        if (!p) {
++          NX_JSON_REPORT_ERROR("endless comment", ps);
++          return 0; // error
++        }
++        p++;
++      }
++      else if (*p=='*') { // block comment
++        p=skip_block_comment(p+1);
++        if (!p) return 0;
++      }
++      else {
++        NX_JSON_REPORT_ERROR("unexpected chars", p-1);
++        return 0; // error
++      }
++    }
++    else {
++      NX_JSON_REPORT_ERROR("unexpected chars", p-1);
++      return 0; // error
++    }
++  }
++  NX_JSON_REPORT_ERROR("unexpected chars", p-1);
++  return 0; // error
++}
++
++static char* parse_value(nx_json* parent, const char* key, char* p, nx_json_unicode_encoder encoder) {
++  nx_json* js;
++  while (1) {
++    switch (*p) {
++      case '\0':
++        NX_JSON_REPORT_ERROR("unexpected end of text", p);
++        return 0; // error
++      case ' ': case '\t': case '\n': case '\r':
++      case ',':
++        // skip
++        p++;
++        break;
++      case '{':
++        js=create_json(NX_JSON_OBJECT, key, parent);
++        p++;
++        while (1) {
++          const char* new_key;
++          p=parse_key(&new_key, p, encoder);
++          if (!p) return 0; // error
++          if (*p=='}') return p+1; // end of object
++          p=parse_value(js, new_key, p, encoder);
++          if (!p) return 0; // error
++        }
++      case '[':
++        js=create_json(NX_JSON_ARRAY, key, parent);
++        p++;
++        while (1) {
++          p=parse_value(js, 0, p, encoder);
++          if (!p) return 0; // error
++          if (*p==']') return p+1; // end of array
++        }
++      case ']':
++        return p;
++      case '"':
++        p++;
++        js=create_json(NX_JSON_STRING, key, parent);
++        js->text_value=unescape_string(p, &p, encoder);
++        if (!js->text_value) return 0; // propagate error
++        return p;
++      case '-': case '0': case '1': case '2': case '3': case '4': case '5': case '6': case '7': case '8': case '9':
++        {
++          js=create_json(NX_JSON_INTEGER, key, parent);
++          char* pe;
++          js->int_value=strtoll(p, &pe, 0);
++          if (pe==p || errno==ERANGE) {
++            NX_JSON_REPORT_ERROR("invalid number", p);
++            return 0; // error
++          }
++          if (*pe=='.' || *pe=='e' || *pe=='E') { // double value
++            js->type=NX_JSON_DOUBLE;
++            js->dbl_value=strtod(p, &pe);
++            if (pe==p || errno==ERANGE) {
++              NX_JSON_REPORT_ERROR("invalid number", p);
++              return 0; // error
++            }
++          }
++          else {
++            js->dbl_value=js->int_value;
++          }
++          return pe;
++        }
++      case 't':
++        if (!strncmp(p, "true", 4)) {
++          js=create_json(NX_JSON_BOOL, key, parent);
++          js->int_value=1;
++          return p+4;
++        }
++        NX_JSON_REPORT_ERROR("unexpected chars", p);
++        return 0; // error
++      case 'f':
++        if (!strncmp(p, "false", 5)) {
++          js=create_json(NX_JSON_BOOL, key, parent);
++          js->int_value=0;
++          return p+5;
++        }
++        NX_JSON_REPORT_ERROR("unexpected chars", p);
++        return 0; // error
++      case 'n':
++        if (!strncmp(p, "null", 4)) {
++          create_json(NX_JSON_NULL, key, parent);
++          return p+4;
++        }
++        NX_JSON_REPORT_ERROR("unexpected chars", p);
++        return 0; // error
++      case '/': // comment
++        if (p[1]=='/') { // line comment
++          char* ps=p;
++          p=strchr(p+2, '\n');
++          if (!p) {
++            NX_JSON_REPORT_ERROR("endless comment", ps);
++            return 0; // error
++          }
++          p++;
++        }
++        else if (p[1]=='*') { // block comment
++          p=skip_block_comment(p+2);
++          if (!p) return 0;
++        }
++        else {
++          NX_JSON_REPORT_ERROR("unexpected chars", p);
++          return 0; // error
++        }
++        break;
++      default:
++        NX_JSON_REPORT_ERROR("unexpected chars", p);
++        return 0; // error
++    }
++  }
++}
++
++const nx_json* nx_json_parse_utf8(char* text) {
++  return nx_json_parse(text, unicode_to_utf8);
++}
++
++const nx_json* nx_json_parse(char* text, nx_json_unicode_encoder encoder) {
++  nx_json js={0};
++  if (!parse_value(&js, 0, text, encoder)) {
++    if (js.child) nx_json_free(js.child);
++    return 0;
++  }
++  return js.child;
++}
++
++const nx_json* nx_json_get(const nx_json* json, const char* key) {
++  if (!json || !key) return &dummy; // never return null
++  nx_json* js;
++  for (js=json->child; js; js=js->next) {
++    if (js->key && !strcmp(js->key, key)) return js;
++  }
++  return &dummy; // never return null
++}
++
++const nx_json* nx_json_item(const nx_json* json, int idx) {
++  if (!json) return &dummy; // never return null
++  nx_json* js;
++  for (js=json->child; js; js=js->next) {
++    if (!idx--) return js;
++  }
++  return &dummy; // never return null
++}
++
++
++#ifdef  __cplusplus
++}
++#endif
++
++#endif  /* NXJSON_C */
+diff --git a/nxjson.h b/nxjson.h
+new file mode 100644
+index 0000000..f85bba2
+--- /dev/null
++++ b/nxjson.h
+@@ -0,0 +1,65 @@
++/*
++ * Copyright (c) 2013 Yaroslav Stavnichiy <yarosla@gmail.com>
++ *
++ * This file is part of NXJSON.
++ *
++ * NXJSON is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU Lesser General Public License
++ * as published by the Free Software Foundation, either version 3
++ * of the License, or (at your option) any later version.
++ *
++ * NXJSON is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with NXJSON. If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef NXJSON_H
++#define NXJSON_H
++
++#ifdef  __cplusplus
++extern "C" {
++#endif
++
++
++typedef enum nx_json_type {
++  NX_JSON_NULL,    // this is null value
++  NX_JSON_OBJECT,  // this is an object; properties can be found in child nodes
++  NX_JSON_ARRAY,   // this is an array; items can be found in child nodes
++  NX_JSON_STRING,  // this is a string; value can be found in text_value field
++  NX_JSON_INTEGER, // this is an integer; value can be found in int_value field
++  NX_JSON_DOUBLE,  // this is a double; value can be found in dbl_value field
++  NX_JSON_BOOL     // this is a boolean; value can be found in int_value field
++} nx_json_type;
++
++typedef struct nx_json {
++  nx_json_type type;       // type of json node, see above
++  const char* key;         // key of the property; for object's children only
++  const char* text_value;  // text value of STRING node
++  long long int_value;     // the value of INTEGER or BOOL node
++  double dbl_value;        // the value of DOUBLE node
++  int length;              // number of children of OBJECT or ARRAY
++  struct nx_json* child;   // points to first child
++  struct nx_json* next;    // points to next child
++  struct nx_json* last_child;
++} nx_json;
++
++typedef int (*nx_json_unicode_encoder)(unsigned int codepoint, char* p, char** endp);
++
++extern nx_json_unicode_encoder nx_json_unicode_to_utf8;
++
++const nx_json* nx_json_parse(char* text, nx_json_unicode_encoder encoder);
++const nx_json* nx_json_parse_utf8(char* text);
++void nx_json_free(const nx_json* js);
++const nx_json* nx_json_get(const nx_json* json, const char* key); // get object's property by key
++const nx_json* nx_json_item(const nx_json* json, int idx); // get array element by index
++
++
++#ifdef  __cplusplus
++}
++#endif
++
++#endif  /* NXJSON_H */
+diff --git a/token-cache.c b/token-cache.c
+new file mode 100644
+index 0000000..b0d9517
+--- /dev/null
++++ b/token-cache.c
+@@ -0,0 +1,158 @@
++/*
++ * Copyright (c) 2014 Jan-Piet Mens <jpmens()gmail.com>
++ * All rights reserved.
++ * 
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are met:
++ * 
++ * 1. Redistributions of source code must retain the above copyright notice,
++ *    this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ * 3. Neither the name of mosquitto nor the names of its
++ *    contributors may be used to endorse or promote products derived from
++ *    this software without specific prior written permission.
++ * 
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#include <stdlib.h>
++#include <stdio.h>
++#include <string.h>
++#include <time.h>
++#include <mosquitto.h>
++#include "token-cache.h"
++#include <openssl/evp.h>
++#include <openssl/sha.h>
++#include "uthash.h"
++#include "log.h"
++
++
++/* access is desired read/write access
++ * granted is what Mosquitto auth-plug actually granted
++ */
++
++void token_cache(const char *token, const char *topic, int access[2], time_t exp)
++{
++	//token length based on sha512 digest and base64 encoding
++	char hex[(SHA512_DIGEST_LENGTH + 2 - ((SHA512_DIGEST_LENGTH+2) %3))/3 * 4 + 1];
++	struct tokencache *a, *tmp;
++	//time_t cacheseconds = exp;
++	time_t now;
++
++	//No token, nothing to cache
++	if (!token) {
++                return;
++        }
++
++	//Sanity check for expiration time
++	now = time(NULL);
++	if (exp-now <= 0) {
++		return;
++	}
++
++	_log(LOG_DEBUG, "Received parameters token: %s", token);
++	_log(LOG_DEBUG, "Received parameters topic:%s", topic);
++	_log(LOG_DEBUG, "Received parameters scope:%d", access[0]);
++	_log(LOG_DEBUG, "Received parameters exp: %s", ctime(&exp));
++
++	strncpy(hex, token, sizeof(hex)); 
++	hex[sizeof(hex)-1]='\0';
++
++	HASH_FIND_STR(cache, hex, a);
++
++	if (a) {
++		//all cached tokens are active
++		a->cachedTokenParams.active = true;
++		a->cachedTokenParams.topic = malloc(strlen(topic));
++		strcpy(a->cachedTokenParams.topic, topic); 
++		for(int i=0; i<2;i++){
++			a->cachedTokenParams.access[i] = access[i];
++		}
++		a->cachedTokenParams.exp = exp;
++
++	} else {
++		a = (struct tokencache *)malloc(sizeof(struct tokencache));		
++		strcpy(a->hex, hex);
++		a->cachedTokenParams.active = true;
++		a->cachedTokenParams.topic = malloc(strlen(topic));
++                strcpy(a->cachedTokenParams.topic, topic);
++		a->cachedTokenParams.exp = exp;
++		for(int i=0; i<2;i++){
++                        a->cachedTokenParams.access[i] = access[i];
++                }
++
++		HASH_ADD_STR(cache, hex, a);
++		_log(LOG_DEBUG, "Token cache cached  [%s] for %s)", hex, topic);
++	}
++
++	/*
++	 * Check whole cache for items which need deleting. Important with
++	 * clients who show up once only (mosquitto_[sp]ub with variable clientIDs
++	 */
++
++	HASH_ITER(hh, cache, a, tmp) {
++		if (now > a->cachedTokenParams.exp) {
++			_log(LOG_DEBUG, " Cleanup [%s]", a->hex);
++			HASH_DEL(cache, a);
++			free(a);
++		}
++	}
++	return;
++}
++
++struct tokenParams token_cache_q(const char *token)
++{
++	 //token length based on sha512 digest and base64 encoding
++        char hex[(SHA512_DIGEST_LENGTH + 2 - ((SHA512_DIGEST_LENGTH+2) %3))/3 * 4 + 1];
++	struct tokencache *a;
++
++	struct tokenParams resultToken;
++	resultToken.active = 0;
++
++
++	if (!token) {
++		return resultToken;
++	}
++
++	strncpy(hex, token, sizeof(hex));
++        hex[sizeof(hex)-1]='\0';
++
++	_log(LOG_DEBUG, "Token to check %s", hex); 
++
++	HASH_FIND_STR(cache, hex, a);
++	if (a) {
++		// printf("---> CACHED! %d\n", a->granted);
++
++		if (time(NULL) > a->cachedTokenParams.exp) {
++			_log(LOG_DEBUG, " Expired [%s]", hex);
++			HASH_DEL(cache, a);
++			free(a);
++		} else {
++			resultToken.active = a->cachedTokenParams.active;
++			resultToken.topic = malloc(strlen(a->cachedTokenParams.topic));
++			strcpy(resultToken.topic, a->cachedTokenParams.topic);
++			resultToken.exp = a->cachedTokenParams.exp;
++			for(int i=0; i<2;i++){
++                        	resultToken.access[i]=a->cachedTokenParams.access[i];
++                	}	
++		}
++	} else {
++		_log(LOG_DEBUG,"No token found in cache");
++	}
++
++	return (resultToken);
++}
++
++
+diff --git a/token-cache.h b/token-cache.h
+new file mode 100644
+index 0000000..b16974b
+--- /dev/null
++++ b/token-cache.h
+@@ -0,0 +1,30 @@
++/*
++ */
++
++#include <time.h>
++#include "uthash.h"
++#include <openssl/sha.h>
++
++#ifndef __TOKENCACHE_H
++# define __TOKENCACHE_H
++
++struct tokenParams{
++	int active;
++	char* topic;
++        int access[2];
++        time_t exp;
++};
++
++struct tokencache {
++	//the key is the token - the size is base64 encoded sha512
++        char hex[(SHA512_DIGEST_LENGTH + 2 - ((SHA512_DIGEST_LENGTH + 2) % 3))/3 * 4 + 1];    
++       	struct tokenParams cachedTokenParams; 
++        UT_hash_handle hh;
++};
++
++static struct tokencache* cache=NULL;
++
++void token_cache(const char *token, const char *topic, int access[2], time_t exp);
++struct tokenParams token_cache_q(const char *token);
++
++#endif
