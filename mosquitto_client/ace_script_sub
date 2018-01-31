@@ -1,0 +1,10 @@
+#!/bin/bash 
+
+username="Put token as username"
+password="Put k as password"
+
+topic="Put topic"
+cafile="Put ca file"
+
+
+./mosquitto_sub -t $topic -u $username -P $password --cafile cafile -p 8883 -h localhost

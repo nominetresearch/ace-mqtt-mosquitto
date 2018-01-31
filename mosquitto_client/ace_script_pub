@@ -1,0 +1,11 @@
+#!/bin/bash 
+
+username="Put in token as user name"
+password="Put k as password"
+
+topic="Put topic"
+message="Put message"
+
+cafile="Put ca file"
+
+./mosquitto_pub -t $topic -m $message -u $username -P $password --cafile cafile -p 8883 -h localhost

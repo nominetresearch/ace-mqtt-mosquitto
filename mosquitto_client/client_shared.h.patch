@@ -1,0 +1,41 @@
+--- client_shared.h	2018-01-31 13:43:31.000000000 +0000
++++ /Users/cigdem/Development/mqtt-trials/mosquitto/client/client_shared.h	2018-01-26 13:39:23.000000000 +0000
+@@ -17,6 +17,18 @@
+ #ifndef _CLIENT_CONFIG_H
+ #define _CLIENT_CONFIG_H
+ 
++/*ACE additions */
++#ifndef _ACE
++#define _ACE
++#include <openssl/evp.h>
++#include <openssl/rand.h>
++#include <openssl/buffer.h>
++#endif
++
++
++/*************************/
++
++
+ #include <stdio.h>
+ 
+ /* pub_client.c modes */
+@@ -53,6 +65,7 @@
+ 	unsigned int max_inflight;
+ 	char *username;
+ 	char *password;
++	char *alg;
+ 	char *will_topic;
+ 	char *will_payload;
+ 	long will_payloadlen;
+@@ -94,4 +107,11 @@
+ int client_id_generate(struct mosq_config *cfg, const char *id_base);
+ int client_connect(struct mosquitto *mosq, struct mosq_config *cfg);
+ 
++/* ACE additions */
++#ifdef _ACE
++int base64_encode(unsigned char *in, unsigned int in_len, char **encoded); 
++#endif
++/*************************/
++
++
+ #endif
