@@ -3,12 +3,15 @@
 This folder contains a demo for the IETF draft
  MQTT-TLS profile of ACE ([https://tools.ietf.org/html/draft-sengul-ace-mqtt-tls-profile-01](https://tools.ietf.org/html/draft-sengul-ace-mqtt-tls-profile-01)).
 
+
  The demo consists of:
  1. Express Node.js based Authorisation Server (AS)
  2. Mosquitto Client extensions
  3. Mosquitto Broker auth_plugin extensions
 
 SystemImplementation.md explains the design choices and limitations of this prototype implementation. 
+
+Important note: To secure the AS additional steps need to be taken, which depends on the particular deployment environment. 
 
 # Build instructions
 
