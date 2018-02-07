@@ -75,6 +75,10 @@ to run the broker.
 
 
 ## Running the mosquitto_auth_plugin
+
+Clone directly from [https://github.com/ciseng/mosquitto-auth-plug/](https://github.com/ciseng/mosquitto-auth-plug/). We try to keep up-to-date with upstream. 
+Or, do the following:
+
 1. Clone the repository in [https://github.com/jpmens/mosquitto-auth-plug/](https://github.com/jpmens/mosquitto-auth-plug/)
 2. You will use the  `ace_auth_plug` folder to patch the plugin.
 3. In your `mosquitto-auth-plug` folder:  
