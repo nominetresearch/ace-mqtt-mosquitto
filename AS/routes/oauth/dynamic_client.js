@@ -50,8 +50,8 @@ router.post('/', function(req, res) {
         //generate client_id
         //generate client_secret
         client.client_id = Random.uid(16);
-        var client_secret = Random.getRandomBytes64(32);
-        client.client_secret_hash = Random.digest256(client_secret);
+        var client_secret = Random.getRandomBytes_base64(32);
+        client.client_secret_hash = Random.digest(client_secret,'sha256');
 
 
         console.log("AS: Dynamic client registration - client generated:",client);
