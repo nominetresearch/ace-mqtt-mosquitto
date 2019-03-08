@@ -17,7 +17,8 @@ Important note: To secure the AS additional steps need to be taken, which depend
 
 ## Running the ACE AS server
 
-(Prerequisite: MongoDB installation - [https://docs.mongodb.com/manual/installation/](https://docs.mongodb.com/manual/installation/))
+(Prerequisite: MongoDB installation - [https://docs.mongodb.com/manual/installation/](https://docs.mongodb.com/manual/installation/)
+and running mongodb)
 
 1. Inside the AS folder,  install all the dependencies:
 ```bash
