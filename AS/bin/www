@@ -17,7 +17,7 @@ var config = require('config.json')('./as_config.json');
 
 var https_options = {}; 
 
-if(fs.existsSync('app_files/ca-key.pem') && fs.existsSync('app_files/ca-key.pem')){
+if(fs.existsSync('app_files/ca-key.pem') && fs.existsSync('app_files/ca-cert.pem')){
 	var key = fs.readFileSync('app_files/ca-key.pem');
 	var cert = fs.readFileSync('app_files/ca-cert.pem');
 
