@@ -129,7 +129,7 @@ server.exchange(oauth2orize.exchange.clientCredentials(function(client,scope,bod
                                     cnf: {
                                         jwk: {
                                             kty: "oct",
-                                            alg: "HS512",
+                                            alg: "HS256",
                                             k:   key
                                         }
                                     }
